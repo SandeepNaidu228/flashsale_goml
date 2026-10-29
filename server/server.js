@@ -1,4 +1,4 @@
-
+﻿
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
@@ -12,10 +12,14 @@ dotenv.config();
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use((req, res, next) => {
+  res.setHeader("X-API-Instance", process.env.INSTANCE_ID || "local");
+  next();
+});
 
 const pool = new Pool({
-  host: "127.0.0.1",
-  port: 5433,
+  host: process.env.DB_HOST || "127.0.0.1",
+  port: Number(process.env.DB_PORT || 5433),
   user: "flashsale",
   password: process.env.DB_PASSWORD,
   database: "flashsale",
@@ -77,6 +81,51 @@ async function connectServices() {
 
   console.log("RabbitMQ connected");
 }
+
+
+let recoveryRunning = false;
+
+async function recoverStalePendingOrders() {
+  if (!rabbitChannel || recoveryRunning) return;
+
+  recoveryRunning = true;
+
+  try {
+    const pending = await pool.query(`
+      SELECT id, product_id, quantity
+      FROM orders
+      WHERE status = 'PENDING'
+        AND created_at < NOW() - INTERVAL '30 seconds'
+      ORDER BY created_at ASC
+      LIMIT 100
+    `);
+
+    if (pending.rowCount === 0) return;
+
+    for (const order of pending.rows) {
+      rabbitChannel.sendToQueue(
+        QUEUE,
+        Buffer.from(JSON.stringify({
+          orderId: order.id,
+          productId: order.product_id,
+          quantity: order.quantity,
+        })),
+        { persistent: true }
+      );
+    }
+
+    await rabbitChannel.waitForConfirms();
+
+    console.log(
+      `Recovery: re-published ${pending.rowCount} stale pending order(s)`
+    );
+  } catch (err) {
+    console.error("Pending-order recovery failed:", err.message);
+  } finally {
+    recoveryRunning = false;
+  }
+}
+
 
 app.get("/health", async (req, res) => {
   try {
@@ -248,3 +297,6 @@ async function start() {
 }
 
 start();
+setInterval(() => {
+  void recoverStalePendingOrders();
+}, 15000).unref();

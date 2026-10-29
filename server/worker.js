@@ -15,9 +15,26 @@ const pool = new Pool({
 
 async function startWorker() {
   const connection = await amqp.connect(process.env.RABBITMQ_URL);
-  const channel = await connection.createChannel();
+  const channel = await connection.createConfirmChannel();
 
-  await channel.assertQueue("checkout_queue", { durable: true });
+  await channel.assertExchange("checkout_dlx", "direct", {
+    durable: true,
+  });
+
+  await channel.assertQueue("checkout_dead", {
+    durable: true,
+  });
+
+  await channel.bindQueue(
+    "checkout_dead",
+    "checkout_dlx",
+    "checkout_failed"
+  );
+
+  await channel.assertQueue("checkout_queue", {
+    durable: true,
+  });
+
   channel.prefetch(10);
 
   console.log("Checkout worker ready");
@@ -25,16 +42,18 @@ async function startWorker() {
   channel.consume("checkout_queue", async (message) => {
     if (!message) return;
 
-    let job;
+    let client;
     let transactionStarted = false;
 
     try {
-      job = JSON.parse(message.content.toString());
+      const job = JSON.parse(message.content.toString());
 
-      await pool.query("BEGIN");
+      client = await pool.connect();
+
+      await client.query("BEGIN");
       transactionStarted = true;
 
-      const order = await pool.query(
+      const order = await client.query(
         "SELECT status FROM orders WHERE id = $1 FOR UPDATE",
         [job.orderId]
       );
@@ -43,15 +62,15 @@ async function startWorker() {
         throw new Error("Order does not exist yet");
       }
 
-      // Already processed: acknowledge the duplicate safely.
+      // Duplicate delivery: don't deduct inventory again.
       if (order.rows[0].status !== "PENDING") {
-        await pool.query("COMMIT");
+        await client.query("COMMIT");
         transactionStarted = false;
         channel.ack(message);
         return;
       }
 
-      const inventory = await pool.query(
+      const inventory = await client.query(
         `UPDATE inventory
          SET stock = stock - $1
          WHERE product_id = $2 AND stock >= $1
@@ -60,37 +79,69 @@ async function startWorker() {
       );
 
       if (!inventory.rowCount) {
-        await pool.query(
+        await client.query(
           "UPDATE orders SET status = 'FAILED' WHERE id = $1",
           [job.orderId]
         );
       } else {
-        await pool.query(
+        await client.query(
           "UPDATE orders SET status = 'CONFIRMED' WHERE id = $1",
           [job.orderId]
         );
       }
 
-      await pool.query("COMMIT");
+      await client.query("COMMIT");
       transactionStarted = false;
 
       channel.ack(message);
+
       console.log(
         `Order ${job.orderId}:`,
         inventory.rowCount ? "CONFIRMED" : "FAILED"
       );
     } catch (err) {
-      if (transactionStarted) {
+      if (client && transactionStarted) {
         try {
-          await pool.query("ROLLBACK");
-        } catch (_) {}
+          await client.query("ROLLBACK");
+        } catch (rollbackError) {
+          console.error("Rollback error:", rollbackError.message);
+        }
       }
 
       console.error("Worker error:", err.message);
 
-      // Requeue transient errors; production needs bounded retries
-      // and dead-letter handling for permanently invalid messages.
-      channel.nack(message, false, true);
+      try {
+        const headers = message.properties.headers || {};
+        const retries = Number(headers["x-retry-count"] || 0);
+
+        if (retries < 3) {
+          channel.sendToQueue(
+            "checkout_queue",
+            message.content,
+            {
+              persistent: true,
+              headers: {
+                ...headers,
+                "x-retry-count": retries + 1,
+              },
+            }
+          );
+
+          await channel.waitForConfirms();
+          channel.ack(message);
+        } else {
+          // Dead-letter the original message after three retries.
+          channel.nack(message, false, false);
+        }
+      } catch (publishError) {
+        console.error("Retry publish failed:", publishError.message);
+
+        // Don't acknowledge the original if republishing failed.
+        // Requeue it for a later attempt.
+        channel.nack(message, false, true);
+      }
+    } finally {
+      if (client) client.release();
     }
   });
 }
